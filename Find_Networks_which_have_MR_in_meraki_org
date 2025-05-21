@@ -1,0 +1,50 @@
+from dotenv import load_dotenv
+import os
+import meraki
+import csv
+
+# === Load from .env file ===
+load_dotenv()
+API_KEY = os.getenv('MERAKI_API_KEY')
+ORG_ID = os.getenv('MERAKI_ORG_ID')
+
+if not API_KEY or not ORG_ID:
+    raise ValueError("Environment variables MERAKI_API_KEY and MERAKI_ORG_ID must be set.")
+
+dashboard = meraki.DashboardAPI(API_KEY, suppress_logging=True)
+OUTPUT_FILE = 'mr_networks_list.csv'
+
+# === Get all networks ===
+print("Fetching all networks in the org...")
+networks = dashboard.organizations.getOrganizationNetworks(ORG_ID)
+print(f"Total networks found: {len(networks)}")
+
+# === Find networks with MR devices ===
+mr_networks = []
+for i, net in enumerate(networks, 1):
+    try:
+        devices = dashboard.networks.getNetworkDevices(net['id'])
+        has_mr = any('MR' in device.get('model', '') for device in devices)
+        print(f"[{i}/{len(networks)}] Checked: {net.get('name', '')} - {'MR Found' if has_mr else 'No MR'}")
+        if has_mr:
+            mr_networks.append({
+                'Network Name': net.get('name', ''),
+                'Network ID': net.get('id', ''),
+                'Type': net.get('type', ''),
+                'Tags': ','.join(net.get('tags', []))
+            })
+    except Exception as e:
+        print(f"Error fetching devices for network {net.get('name', '')}: {e}")
+
+print(f"Found {len(mr_networks)} networks with MR devices.")
+
+# === Export to CSV ===
+if mr_networks:
+    with open(OUTPUT_FILE, 'w', newline='', encoding='utf-8') as csvfile:
+        fieldnames = ['Network Name', 'Network ID', 'Type', 'Tags']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(mr_networks)
+    print(f"Exported {len(mr_networks)} MR networks to {OUTPUT_FILE}")
+else:
+    print("No MR device networks found.")
