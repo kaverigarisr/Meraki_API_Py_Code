@@ -3,7 +3,7 @@ import meraki
 # Replace with your values
 API_KEY = 'API-KEY'
 ORG_ID = '123456'  # Test Organization ID
-NETWORK_NAME = 'Test-Network-WAN'
+NETWORK_NAME = 'Test-Network-WAN' # replace with your network name
 
 # Serial numbers of devices you want to add
 # MS_SERIAL = '123-4567-8901'
