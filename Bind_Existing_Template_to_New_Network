@@ -1,0 +1,37 @@
+import meraki
+
+# Replace with your actual values
+API_KEY = 'YOUR_API_KEY'    # Replace with your actual API key
+ORG_ID = '123456'                     # The company Org ID
+TEMPLATE_NAME = 'Test-Template'    # Replace with your actual template name
+NEW_NETWORK_NAME = 'new-SD-WAN-network'  # Name for the new network
+
+dashboard = meraki.DashboardAPI(API_KEY)
+
+# Step 1: Get all configuration templates in the org
+templates = dashboard.organizations.getOrganizationConfigTemplates(ORG_ID)
+
+# Step 2: Find template ID by name
+template = next((t for t in templates if t['name'] == TEMPLATE_NAME), None)
+
+if not template:
+    print(f"❌ Template '{TEMPLATE_NAME}' not found.")
+    exit(1)
+
+template_id = template['id']
+print(f"✅ Found template '{TEMPLATE_NAME}' with ID: {template_id}")
+
+# Step 3: Create a test network and bind it to the template
+try:
+    new_network = dashboard.organizations.createOrganizationNetwork(
+        organizationId=ORG_ID,
+        name=NEW_NETWORK_NAME,
+        productTypes=template['productTypes'],  # match template type
+        timeZone='Australia/Melbourne',
+        tags=['test', 'tsa'],
+        configTemplateId=template_id
+    )
+    print(f"✅ Created and bound network '{NEW_NETWORK_NAME}' to template.")
+    print(f"Network ID: {new_network['id']}")
+except Exception as e:
+    print(f"❌ Failed to create and bind network: {e}")
