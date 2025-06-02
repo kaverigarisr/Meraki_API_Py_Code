@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""
+Add the WIFI-Voice tag to all wireless (MR) devices
+in the Meraki network 'TEST Network'.
+"""
+
+import os
+import sys
+import meraki
+
+def main():
+    # ─── CONFIGURATION ─────────────────────────────────────────────
+    # Set these in your environment, or hard-code here (not recommended):
+    API_KEY = os.getenv('MERAKI_API_KEY')
+    ORG_ID  = os.getenv('MERAKI_ORG_ID')
+    TARGET_NETWORK_NAME = 'Test Network'  # Change to your target network name
+    NEW_TAG = 'vlan1234'  # Change to your target tag name
+
+    if not API_KEY or not ORG_ID:
+        sys.exit('❌ Please set MERAKI_API_KEY and MERAKI_ORG_ID environment variables.')
+
+    # Initialize dashboard client
+    dashboard = meraki.DashboardAPI(
+        api_key=API_KEY,
+        suppress_logging=True,
+        log_file_prefix=False
+    )
+
+    # ─── FIND NETWORK ────────────────────────────────────────────
+    print(f'🔍 Locating network "{TARGET_NETWORK_NAME}" in org {ORG_ID}...')
+    networks = dashboard.organizations.getOrganizationNetworks(ORG_ID)
+    net = next((n for n in networks if n['name'] == TARGET_NETWORK_NAME), None)
+    if not net:
+        sys.exit(f'❌ Network "{TARGET_NETWORK_NAME}" not found in org {ORG_ID}.')
+
+    network_id = net['id']
+    print(f'✅ Found network ID: {network_id}')
+
+    # ─── GET ALL DEVICES ─────────────────────────────────────────
+    print('📡 Retrieving devices in network...')
+    devices = dashboard.networks.getNetworkDevices(network_id)
+
+    # Filter for wireless APs (models starting with "MR")
+    aps = [d for d in devices if d.get('model', '').startswith('MR')]
+    if not aps:
+        print('⚠️  No MR devices found in this network.')
+        return
+
+    print(f'📶 Found {len(aps)} wireless AP(s): {[d["serial"] for d in aps]}')
+
+    # ─── TAG APs ──────────────────────────────────────────────────
+    for ap in aps:
+        serial = ap['serial']
+        current_tags = ap.get('tags') or []
+        if NEW_TAG in current_tags:
+            print(f'➡️  {serial} already has tag "{NEW_TAG}", skipping.')
+            continue
+
+        new_tags = current_tags + [NEW_TAG]
+        try:
+            dashboard.devices.updateDevice(
+                serial,
+                tags=new_tags
+            )
+            print(f'✅ Tagged {serial} with "{NEW_TAG}".')
+        except meraki.APIError as e:
+            print(f'❌ Failed to tag {serial}: {e}')
+
+if __name__ == '__main__':
+    main()
