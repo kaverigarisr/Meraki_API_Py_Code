@@ -1,0 +1,66 @@
+import meraki
+
+# ─── CONFIGURATION ────────────────────────────────────────────────────────────
+API_KEY          = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+ORG_ID           = '123456'
+TEMPLATE_NAME    = 'test-Network-Tier2-MX-Small'
+NEW_NETWORK_NAME = 'a-qld-t2-test-wan'
+
+dashboard = meraki.DashboardAPI(API_KEY, suppress_logging=True)
+
+# ─── FIND TEMPLATE ───────────────────────────────────────────────────────────
+templates = dashboard.organizations.getOrganizationConfigTemplates(ORG_ID)
+template  = next((t for t in templates if t['name'].lower() == TEMPLATE_NAME.lower()), None)
+if not template:
+    print(f"❌ Template '{TEMPLATE_NAME}' not found.")
+    exit(1)
+
+template_id   = template['id']
+product_types = template['productTypes']
+print(f"✅ Found template '{TEMPLATE_NAME}' (ID: {template_id})")
+
+# ─── FIND OR CREATE NETWORK ───────────────────────────────────────────────────
+existing_nets = dashboard.organizations.getOrganizationNetworks(ORG_ID)
+existing      = next((n for n in existing_nets if n['name'] == NEW_NETWORK_NAME), None)
+
+if existing:
+    network_id = existing['id']
+    print(f"ℹ️ Network '{NEW_NETWORK_NAME}' already exists (ID: {network_id}), reusing it")
+else:
+    print(f"🛠 Creating network '{NEW_NETWORK_NAME}'...")
+    try:
+        new_net = dashboard.organizations.createOrganizationNetwork(
+            organizationId=ORG_ID,
+            name=NEW_NETWORK_NAME,
+            productTypes=product_types,
+            timeZone='Australia/Brisbane',
+            tags=['Tier2','FHV'],
+            configTemplateId=template_id
+        )
+        network_id = new_net['id']
+        print(f"✅ Created and bound network '{NEW_NETWORK_NAME}' (ID: {network_id})")
+    except meraki.APIError as e:
+        # If another user created it in the meantime, fetch its ID
+        if 'Name has already been taken' in str(e):
+            existing = next((n for n in dashboard.organizations.getOrganizationNetworks(ORG_ID)
+                             if n['name'] == NEW_NETWORK_NAME), None)
+            network_id = existing['id']
+            print(f"ℹ️ Detected existing network after race: reusing ID {network_id}")
+        else:
+            print(f"❌ Failed to create network: {e}")
+            exit(1)
+
+# ─── BIND TO TEMPLATE ─────────────────────────────────────────────────────────
+print(f"\n📎 Binding network '{NEW_NETWORK_NAME}' to template '{TEMPLATE_NAME}'...")
+try:
+    dashboard.networks.bindNetwork(
+        networkId=network_id,
+        configTemplateId=template_id,
+        autoBind=False
+    )
+    print("✅ Network successfully bound to template.")
+except Exception as e:
+    print(f"❌ Failed to bind network: {e}")
+
+# ─── DONE ─────────────────────────────────────────────────────────────────────
+print("\n🎉 Done.")
