@@ -1,0 +1,43 @@
+import os
+import meraki
+
+API_KEY = 'xxxxxxxx'
+ORG_ID = '123456'
+
+serials_to_claim = [
+    #"Q3LU-1234-5678",
+    #"Q3LU-5678-1234",
+    #"Q3AL-1111-2222",
+    #"Q3AL-3333-3333",
+    #"Q3AL-QJ7A-R8QN",
+"Q3AI-1234-5678",
+"Q3AL-1234-2345",
+"Q3AL-1122-3344",
+"Q3AL-4444-5678",
+"Q3AL-2343-1234",
+    #"Q3AK-2432-2345",
+]
+
+dashboard = meraki.DashboardAPI(API_KEY, suppress_logging=True)
+
+claimed = []
+already_claimed = []
+
+for serial in serials_to_claim:
+    try:
+        dashboard.organizations.claimIntoOrganization(
+            organizationId=ORG_ID,
+            serials=[serial]
+        )
+        print(f"✅ Claimed: {serial}")
+        claimed.append(serial)
+    except meraki.APIError as e:
+        if "already claimed" in str(e).lower():
+            print(f"⚠️ Already claimed: {serial}")
+            already_claimed.append(serial)
+        else:
+            print(f"❌ Error claiming {serial}: {e}")
+
+print("\n📋 Summary:")
+print(f"✅ Claimed: {claimed}")
+print(f"⚠️ Already claimed: {already_claimed}")
