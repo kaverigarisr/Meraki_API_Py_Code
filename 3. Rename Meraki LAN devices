@@ -1,0 +1,63 @@
+import meraki
+
+# ── CONFIG ────────────────────────────────────────────────────────────────────────
+API_KEY       = ''  # ← your API key here (or use MERAKI_API_KEY env var)
+ORG_ID        = ''
+NETWORK_NAME  = 'test-lan'
+
+# Replace with your site’s street address
+DEVICE_ADDRESS = '123 xyz Street, West Melbourne, 3003 VIC, Australia'
+
+# Replace with your site code / prefix  
+PREFIX = 'au-vic-v213'
+# au - country , vic - state, v213 site code
+
+dashboard = meraki.DashboardAPI(API_KEY, suppress_logging=True)
+
+# 1. Find the network ID by name
+networks = dashboard.organizations.getOrganizationNetworks(ORG_ID)
+net = next((n for n in networks if n['name'] == NETWORK_NAME), None)
+if not net:
+    print(f"❌ Network '{NETWORK_NAME}' not found in org {ORG_ID}.")
+    exit(1)
+network_id = net['id']
+print(f"✅ Found network '{NETWORK_NAME}' (ID: {network_id})\n")
+
+# 2. List all devices in the network
+devices = dashboard.networks.getNetworkDevices(network_id)
+
+# 3. Iterate and rename/set address + move marker
+sw_count  = 1
+wap_count = 1
+mx_count  = 1
+
+for device in devices:
+    serial = device['serial']
+    model  = device['model']
+
+    if model.startswith('MS'):  # Meraki switch
+        new_name = f"{PREFIX}-asw-p-{sw_count:03}"
+        sw_count += 1
+
+    elif model.startswith('MR'):  # Meraki AP
+        new_name = f"{PREFIX}-wap-p-{wap_count:03}"
+        wap_count += 1
+
+    elif model.startswith('MX'):  # Meraki MX
+        new_name = f"{PREFIX}-mx-p-{mx_count:03}"
+        mx_count += 1
+
+    else:
+        print(f"ℹ️  Skipping {serial} (model {model})")
+        continue
+
+    # Update name, address, and move the map marker
+    dashboard.devices.updateDevice(
+        serial,
+        name=new_name,
+        address=DEVICE_ADDRESS,
+        moveMapMarker=True
+    )
+    print(f"✅ {model} {serial} → {new_name}; address set & marker moved")
+
+print("\n🎉 All devices renamed and address/map marker updated.")
