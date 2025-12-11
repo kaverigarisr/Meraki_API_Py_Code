@@ -1,0 +1,129 @@
+import requests
+import ipaddress
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# --- USER CONFIG ---
+NETBOX_URL = "https://netbox.com"
+NETBOX_TOKEN = ""
+MERAKI_API_KEY = ""
+MERAKI_ORG_ID = "123456"
+DRY_RUN = False  # Set to False to actually push changes!
+
+HEADERS_NB = {"Authorization": f"Token {NETBOX_TOKEN}", "Accept": "application/json"}
+HEADERS_MK = {"X-Cisco-Meraki-API-Key": MERAKI_API_KEY, "Content-Type": "application/json"}
+
+def nb_get(endpoint, params=None):
+    return requests.get(f"{NETBOX_URL}/api/{endpoint}", headers=HEADERS_NB, params=params, verify=False)
+
+def get_site_id(site_slug):
+    resp = nb_get("dcim/sites/", {"slug": site_slug})
+    resp.raise_for_status()
+    data = resp.json().get("results", [])
+    if not data:
+        print(f"❌ NetBox site '{site_slug}' not found.")
+        exit(1)
+    return data[0]["id"]
+
+def get_prefixes(site_id):
+    resp = nb_get("ipam/prefixes/", {"site_id": site_id, "limit": 1000})
+    resp.raise_for_status()
+    results = resp.json()["results"]
+    print("\n--- Prefixes fetched from NetBox ---")
+    for p in results:
+        status_val = p['status']['label'] if isinstance(p['status'], dict) and 'label' in p['status'] else str(p['status'])
+        print(f"{p['prefix']:<18} status={status_val:<12} id={p['id']} desc={p.get('description','')}")
+    filtered = [
+        p for p in results 
+        if ((p['status']['value'] if isinstance(p['status'], dict) and 'value' in p['status'] else p['status']) == "active")
+    ]
+    print(f"\nTotal active prefixes found: {len(filtered)}\n")
+    return filtered
+
+def list_meraki_networks():
+    url = f"https://api.meraki.com/api/v1/organizations/{MERAKI_ORG_ID}/networks"
+    resp = requests.get(url, headers=HEADERS_MK, verify=False)
+    resp.raise_for_status()
+    return resp.json()
+
+def get_meraki_network_id_by_name(networks, network_name):
+    for net in networks:
+        if net['name'].strip() == network_name.strip():
+            return net['id']
+    return None
+
+def get_meraki_vlans(network_id):
+    url = f"https://api.meraki.com/api/v1/networks/{network_id}/appliance/vlans"
+    resp = requests.get(url, headers=HEADERS_MK, verify=False)
+    if resp.status_code != 200:
+        return []
+    return resp.json()
+
+def upsert_vlan_to_meraki(prefix, vlan_id, vlan_name, meraki_net_id, existing_vlans):
+    network = ipaddress.ip_network(prefix)
+    default_gw = str(list(network.hosts())[0])
+    payload_update = {
+        "name": vlan_name,
+        "subnet": prefix,
+        "applianceIp": default_gw
+    }
+    vlan_id_str = str(vlan_id)
+    exists = any(str(vlan['id']) == vlan_id_str for vlan in existing_vlans)
+    if exists:
+        url = f"https://api.meraki.com/api/v1/networks/{meraki_net_id}/appliance/vlans/{vlan_id_str}"
+        if DRY_RUN:
+            print(f"🧪 DRY RUN: Would UPDATE VLAN {vlan_id_str} with {payload_update}")
+            return
+        resp = requests.put(url, headers=HEADERS_MK, json=payload_update)
+        if resp.ok:
+            print(f"✅ Updated VLAN {vlan_id} ({prefix}) in Meraki")
+        else:
+            print(f"❌ Failed to update VLAN {vlan_id}: {resp.status_code} {resp.text}")
+    else:
+        payload_create = payload_update.copy()
+        payload_create["id"] = vlan_id_str
+        url = f"https://api.meraki.com/api/v1/networks/{meraki_net_id}/appliance/vlans"
+        if DRY_RUN:
+            print(f"🧪 DRY RUN: Would CREATE VLAN {vlan_id_str} with {payload_create}")
+            return
+        resp = requests.post(url, headers=HEADERS_MK, json=payload_create)
+        if resp.ok:
+            print(f"✅ Created VLAN {vlan_id} ({prefix}) in Meraki")
+        else:
+            print(f"❌ Failed to create VLAN {vlan_id}: {resp.status_code} {resp.text}")
+
+def main():
+    site_slug = input("Enter NetBox Site Slug: ").strip()
+    site_id = get_site_id(site_slug)
+
+    prefixes = get_prefixes(site_id)
+    if not prefixes:
+        print("No active prefixes found in NetBox for this site.")
+        return
+
+    # Prompt for Meraki network name
+    network_name = input("Enter Meraki Network Name: ").strip()
+    networks = list_meraki_networks()
+    meraki_net_id = get_meraki_network_id_by_name(networks, network_name)
+    if not meraki_net_id:
+        print(f"\n❌ Network '{network_name}' not found in your Meraki org.")
+        print("Available networks are:")
+        for net in networks:
+            print(f" - {net['name']}")
+        return
+    print(f"Selected Meraki Network: {network_name} (ID: {meraki_net_id})\n")
+
+    # Get current VLANs in Meraki network
+    existing_vlans = get_meraki_vlans(meraki_net_id)
+    print("\nExisting VLANs in Meraki:")
+    for vlan in existing_vlans:
+        print(f"  id={vlan['id']} name={vlan.get('name','')} subnet={vlan.get('subnet','')}")
+
+    for p in prefixes:
+        vlan_id = p.get("vlan", {}).get("vid") or p["id"]
+        vlan_name = p.get("description") or f"VLAN {vlan_id}"
+        upsert_vlan_to_meraki(p["prefix"], vlan_id, vlan_name, meraki_net_id, existing_vlans)
+
+if __name__ == "__main__":
+    main()
