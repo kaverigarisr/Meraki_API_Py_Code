@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+import os
+import sys
+import meraki
+
+# ---------------- CONFIG ----------------
+API_KEY = os.getenv("MERAKI_API_KEY", "")
+ORG_ID = "123456"
+NETWORK_NAME = "r-nsw-tier4-Test-lan"
+
+DRY_RUN = False  # set False to apply
+
+# Port 1 uplink
+UPLINK_PORT = 1
+UPLINK_NATIVE_VLAN = 40
+UPLINK_ALLOWED = "all"
+UPLINK_STP = "disabled"
+
+# Default user ports
+ACCESS_DATA_VLAN = 10
+ACCESS_VOICE_VLAN = 20
+ACCESS_STP = "bpdu guard"
+
+# WAP ports (at end of RJ45 range)
+WAP_NAME = "Wireless access point"
+WAP_NATIVE_VLAN = 30
+WAP_ALLOWED = "all"
+WAP_STP = "bpdu guard"
+
+WAP_LAST_N_BY_RJ45 = {48: 6, 24: 4, 8: 2}
+# ---------------------------------------
+
+
+def rj45_base_from_model(model: str) -> int | None:
+    """
+    Prefer model parsing because Meraki port lists may include SFP/uplink ports.
+    Examples:
+      MS120-8FP  -> 8
+      MS120-24P  -> 24
+      MS120-48FP -> 48
+    """
+    model = (model or "").upper()
+    if "-48" in model:
+        return 48
+    if "-24" in model:
+        return 24
+    if "-8" in model:
+        return 8
+    return None
+
+
+def main():
+    if not API_KEY:
+        print("❌ MERAKI_API_KEY is not set.")
+        sys.exit(1)
+
+    dashboard = meraki.DashboardAPI(API_KEY, suppress_logging=True)
+
+    nets = dashboard.organizations.getOrganizationNetworks(ORG_ID)
+    net = next((n for n in nets if n.get("name") == NETWORK_NAME), None)
+    if not net:
+        raise SystemExit(f"❌ Network '{NETWORK_NAME}' not found.")
+    network_id = net["id"]
+    print(f"✅ Found network '{NETWORK_NAME}' (ID: {network_id})")
+
+    devices = dashboard.networks.getNetworkDevices(network_id)
+    switches = [d for d in devices if str(d.get("model", "")).startswith("MS")]
+    print(f"🔍 Found {len(switches)} MS switch(es). Starting port configuration...\n")
+
+    for sw in switches:
+        serial = sw["serial"]
+        model = sw.get("model", "UNKNOWN")
+        sw_name = sw.get("name") or serial
+
+        ports = dashboard.switch.getDeviceSwitchPorts(serial)
+
+        # collect numeric port IDs that exist on this device
+        numeric_ports = sorted(
+            {int(p["portId"]) for p in ports if str(p.get("portId", "")).isdigit()}
+        )
+        if not numeric_ports:
+            print(f"⚠️ {model} {sw_name} ({serial}): no numeric ports; skipping.")
+            continue
+
+        rj45_base = rj45_base_from_model(model)
+        if rj45_base is None:
+            # fall back: choose the largest standard base that exists
+            rj45_base = 48 if 48 in numeric_ports else 24 if 24 in numeric_ports else 8 if 8 in numeric_ports else max(numeric_ports)
+
+        wap_last_n = WAP_LAST_N_BY_RJ45.get(rj45_base, 0)
+        wap_ports = set(range(rj45_base - wap_last_n + 1, rj45_base + 1)) if wap_last_n else set()
+
+        print(f"🧩 {model} {sw_name} ({serial}): RJ45 base={rj45_base}; WAP ports={sorted(wap_ports) if wap_ports else 'none'}")
+
+        # Apply to RJ45 ports only (1..rj45_base)
+        for port_id in range(1, rj45_base + 1):
+            if port_id not in numeric_ports:
+                continue
+
+            # Port 1 uplink
+            if port_id == UPLINK_PORT:
+                payload = {
+                    "type": "trunk",
+                    "vlan": UPLINK_NATIVE_VLAN,
+                    "allowedVlans": UPLINK_ALLOWED,
+                    "stpGuard": UPLINK_STP,
+                }
+                action = "UPLINK"
+
+            # WAP ports at end
+            elif port_id in wap_ports:
+                payload = {
+                    "name": WAP_NAME,
+                    "type": "trunk",
+                    "vlan": WAP_NATIVE_VLAN,
+                    "allowedVlans": WAP_ALLOWED,
+                    "stpGuard": WAP_STP,
+                }
+                action = "WAP"
+
+            # Everything else = access + voice + BPDU guard
+            else:
+                payload = {
+                    "type": "access",
+                    "vlan": ACCESS_DATA_VLAN,
+                    "voiceVlan": ACCESS_VOICE_VLAN,
+                    "stpGuard": ACCESS_STP,
+                }
+                action = "ACCESS"
+
+            if DRY_RUN:
+                print(f"  🧪 DRY_RUN {action}: port {port_id} payload={payload}")
+                continue
+
+            try:
+                dashboard.switch.updateDeviceSwitchPort(
+                    serial=serial,
+                    portId=str(port_id),
+                    **payload
+                )
+                print(f"  ✅ {action}: port {port_id} updated")
+            except meraki.APIError as e:
+                print(f"  ❌ {action}: port {port_id} failed: {e}")
+
+        print()
+
+    print("🎉 Completed.")
+
+
+if __name__ == "__main__":
+    main()
