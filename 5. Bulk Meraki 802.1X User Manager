@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+"""
+Bulk create/update Meraki Auth 802.1X users for a target SSID across multiple networks.
+
+Behavior:
+- Same password per user across all selected networks in the same run
+- Update existing users in each target network
+- Create missing users in each target network
+- If create returns "Email has already been taken", re-read users from that same
+  network and attempt update again
+- Optional email via Meraki on first network only
+- Password symbols limited to: ! @ # $ % & * ( )
+
+Official Cisco Meraki API docs:
+- Create user:  https://developer.cisco.com/meraki/api-v1/create-network-meraki-auth-user/
+- Get users:    https://developer.cisco.com/meraki/api-v1/get-network-meraki-auth-users/
+- Update user:  https://developer.cisco.com/meraki/api-v1/update-network-meraki-auth-user/
+- Pagination:   https://developer.cisco.com/meraki/api-v1/pagination/
+"""
+
+import os
+import csv
+import re
+import sys
+import string
+import secrets
+import requests
+import meraki
+
+# --------------------------------------------------------------------
+# CONFIG
+# --------------------------------------------------------------------
+
+API_KEY = os.getenv("MERAKI_API_KEY") or ""
+ORG_ID = ""
+SSID_NAME = "WiFi-Meraki"
+
+NETWORK_NAMES = []  # leave empty to prompt
+USE_CSV = False
+CSV_PATH = "users.csv"  # example only
+
+STATIC_USERS = [
+    {"email": "user@example.com", "description": "Example User"},
+]
+
+PASSWORD_LENGTH = 10
+REUSE_PASSWORD_ACROSS_NETWORKS = True
+EMAIL_PASSWORD_ON_FIRST_NETWORK_ONLY = True
+FORCE_SSID_AUTHORIZATION_ON_UPDATE = True
+
+SYMBOLS = "!@#$%&*()"
+
+# --------------------------------------------------------------------
+# HELPERS
+# --------------------------------------------------------------------
+
+def generate_password(length: int = PASSWORD_LENGTH) -> str:
+    if length < 8:
+        length = 8
+
+    lower = string.ascii_lowercase
+    upper = string.ascii_uppercase
+    digits = string.digits
+    symbols = SYMBOLS
+
+    pwd = [
+        secrets.choice(lower),
+        secrets.choice(upper),
+        secrets.choice(digits),
+        secrets.choice(symbols),
+    ]
+
+    all_chars = lower + upper + digits + symbols
+    pwd.extend(secrets.choice(all_chars) for _ in range(length - 4))
+    secrets.SystemRandom().shuffle(pwd)
+    return "".join(pwd)
+
+
+def parse_next_link(link_header: str):
+    if not link_header:
+        return None
+    for part in link_header.split(","):
+        part = part.strip()
+        if 'rel=next' in part or 'rel="next"' in part:
+            match = re.search(r"<([^>]+)>", part)
+            if match:
+                return match.group(1)
+    return None
+
+
+def meraki_get(url: str, api_key: str, params=None):
+    headers = {
+        "X-Cisco-Meraki-API-Key": api_key,
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    response = requests.get(url, headers=headers, params=params, timeout=60)
+    response.raise_for_status()
+    return response
+
+
+def get_all_meraki_auth_users(network_id: str):
+    url = f"https://api.meraki.com/api/v1/networks/{network_id}/merakiAuthUsers"
+    users = []
+    params = {"perPage": 1000}
+
+    while url:
+        response = meraki_get(url, API_KEY, params=params)
+        batch = response.json()
+
+        if isinstance(batch, list):
+            users.extend(batch)
+        else:
+            break
+
+        url = parse_next_link(response.headers.get("Link"))
+        params = None
+
+    return users
+
+
+def load_users():
+    if USE_CSV:
+        with open(CSV_PATH, newline="", encoding="utf-8-sig") as handle:
+            rows = csv.DictReader(handle)
+            users = []
+            for row in rows:
+                email = (row.get("email") or "").strip().lower()
+                if not email:
+                    continue
+                desc = (row.get("description") or row.get("name") or email).strip()
+                users.append({"email": email, "description": desc})
+
+            if not users:
+                raise RuntimeError(f"No valid users found in CSV: {CSV_PATH}")
+            return users
+
+    users = []
+    for entry in STATIC_USERS:
+        email = (entry.get("email") or "").strip().lower()
+        if not email:
+            continue
+        desc = (entry.get("description") or email).strip()
+        users.append({"email": email, "description": desc})
+
+    if not users:
+        raise RuntimeError("No valid users configured.")
+    return users
+
+
+def prompt_network_names():
+    raw = input("Enter network names (comma-separated, exact match): ").strip()
+    if not raw:
+        raise RuntimeError("Network names cannot be empty.")
+    return [name.strip() for name in raw.split(",") if name.strip()]
+
+
+def get_network_map(dashboard, org_id: str):
+    networks = dashboard.organizations.getOrganizationNetworks(org_id)
+    result = {}
+
+    for network in networks:
+        name = network.get("name", "").strip().lower()
+        if not name:
+            continue
+        if name in result:
+            raise RuntimeError(f"Duplicate network name found in org: {network.get('name')}")
+        result[name] = network["id"]
+
+    return result
+
+
+def get_ssid_number(dashboard, network_id: str, ssid_name: str) -> int:
+    ssids = dashboard.wireless.getNetworkWirelessSsids(network_id)
+    for ssid in ssids:
+        if ssid.get("name", "").strip().lower() == ssid_name.strip().lower():
+            return ssid["number"]
+    raise RuntimeError(f"SSID '{ssid_name}' not found in network {network_id}")
+
+
+def index_users_by_email(users):
+    indexed = {}
+    for user in users:
+        email = (user.get("email") or "").strip().lower()
+        if email:
+            indexed[email] = user
+    return indexed
+
+
+def user_has_target_ssid(user_obj: dict, ssid_number: int) -> bool:
+    auths = user_obj.get("authorizations")
+    if not isinstance(auths, list):
+        return False
+    return any(auth.get("ssidNumber") == ssid_number for auth in auths)
+
+
+def create_user(dashboard, network_id, ssid_number, email, name, password, send_email):
+    return dashboard.networks.createNetworkMerakiAuthUser(
+        network_id,
+        email=email,
+        authorizations=[{"ssidNumber": ssid_number}],
+        name=name,
+        password=password,
+        accountType="802.1X",
+        emailPasswordToUser=send_email,
+        isAdmin=False,
+    )
+
+
+def update_user(dashboard, network_id, user_id, ssid_number, password, send_email, force_auth):
+    kwargs = {
+        "password": password,
+        "emailPasswordToUser": send_email,
+    }
+    if force_auth:
+        kwargs["authorizations"] = [{"ssidNumber": ssid_number}]
+
+    return dashboard.networks.updateNetworkMerakiAuthUser(
+        network_id,
+        user_id,
+        **kwargs,
+    )
+
+
+# --------------------------------------------------------------------
+# MAIN
+# --------------------------------------------------------------------
+
+def main():
+    if not API_KEY or API_KEY == "PUT_API_KEY_HERE":
+        print("ERROR: Set MERAKI_API_KEY environment variable or edit API_KEY.", file=sys.stderr)
+        sys.exit(1)
+
+    if not ORG_ID:
+        print("ERROR: ORG_ID is empty.", file=sys.stderr)
+        sys.exit(1)
+
+    dashboard = meraki.DashboardAPI(
+        API_KEY,
+        print_console=False,
+        suppress_logging=True,
+    )
+
+    users = load_users()
+    network_names = NETWORK_NAMES[:] if NETWORK_NAMES else prompt_network_names()
+    network_map = get_network_map(dashboard, ORG_ID)
+
+    password_by_email = {}
+    if REUSE_PASSWORD_ACROSS_NETWORKS:
+        for user in users:
+            password_by_email[user["email"]] = generate_password()
+
+    total_created = 0
+    total_updated = 0
+    total_failed = 0
+
+    print(f"\nUsers: {len(users)}")
+    print(f"Networks: {len(network_names)}")
+    print(f"SSID: {SSID_NAME}\n")
+
+    for net_index, network_name in enumerate(network_names):
+        print(f"\n=== {network_name} ===")
+
+        network_id = network_map.get(network_name.lower())
+        if not network_id:
+            print(f"[ERROR] Network not found: {network_name}", file=sys.stderr)
+            total_failed += len(users)
+            continue
+
+        try:
+            ssid_number = get_ssid_number(dashboard, network_id, SSID_NAME)
+        except Exception as exc:
+            print(f"[ERROR] SSID lookup failed for {network_name}: {exc}", file=sys.stderr)
+            total_failed += len(users)
+            continue
+
+        try:
+            existing_users = index_users_by_email(get_all_meraki_auth_users(network_id))
+        except Exception as exc:
+            print(f"[ERROR] Could not list Meraki Auth users for {network_name}: {exc}", file=sys.stderr)
+            total_failed += len(users)
+            continue
+
+        for user in users:
+            email = user["email"]
+            desc = user["description"]
+            email_l = email.lower()
+
+            password = password_by_email[email_l] if REUSE_PASSWORD_ACROSS_NETWORKS else generate_password()
+            send_email = True
+            if REUSE_PASSWORD_ACROSS_NETWORKS and EMAIL_PASSWORD_ON_FIRST_NETWORK_ONLY:
+                send_email = (net_index == 0)
+
+            try:
+                existing = existing_users.get(email_l)
+
+                if existing:
+                    user_id = existing.get("id")
+                    if not user_id:
+                        raise RuntimeError(f"No user id returned for existing user {email}")
+
+                    force_auth = FORCE_SSID_AUTHORIZATION_ON_UPDATE or not user_has_target_ssid(existing, ssid_number)
+
+                    update_user(
+                        dashboard,
+                        network_id,
+                        user_id,
+                        ssid_number,
+                        password,
+                        send_email,
+                        force_auth,
+                    )
+                    total_updated += 1
+                    print(f"[UPDATED] {email} | {network_name}")
+
+                else:
+                    try:
+                        create_user(
+                            dashboard,
+                            network_id,
+                            ssid_number,
+                            email,
+                            desc,
+                            password,
+                            send_email,
+                        )
+                        total_created += 1
+                        print(f"[CREATED] {email} | {network_name}")
+
+                    except meraki.exceptions.APIError as exc:
+                        if "Email has already been taken" not in str(exc):
+                            raise
+
+                        existing_users = index_users_by_email(get_all_meraki_auth_users(network_id))
+                        existing = existing_users.get(email_l)
+
+                        if not existing or not existing.get("id"):
+                            raise RuntimeError(
+                                f"Email already taken but no matching user id found in network {network_name}"
+                            )
+
+                        update_user(
+                            dashboard,
+                            network_id,
+                            existing["id"],
+                            ssid_number,
+                            password,
+                            send_email,
+                            True,
+                        )
+                        total_updated += 1
+                        print(f"[UPDATED-AFTER-RECHECK] {email} | {network_name}")
+
+            except Exception as exc:
+                total_failed += 1
+                print(f"[FAILED] {email} | {network_name} | {exc}", file=sys.stderr)
+
+    print("\nDone")
+    print(f"Created : {total_created}")
+    print(f"Updated : {total_updated}")
+    print(f"Failed  : {total_failed}")
+
+
+if __name__ == "__main__":
+    main()
